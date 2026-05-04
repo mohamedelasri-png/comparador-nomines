@@ -6,13 +6,14 @@ import pandas as pd
 import re
 from io import BytesIO
 
+# Ruta local de Tesseract. En cloud pot no existir, però no molesta si el PDF ja té text.
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 st.title("Comparador de nòmines")
 st.write("Mostra només treballadors amb incidències respecte el mes anterior.")
 
 pdf_mes_anterior = st.file_uploader("PDF mes anterior", type="pdf")
-pdf_mes_actual = st.file_uploader("PDF mes actual", type="pdf")
+pdf_mes_actual = st.file_uploader("PDF actual", type="pdf")
 
 
 def convertir_numero(valor):
@@ -48,10 +49,13 @@ def llegir_pdf(pdf):
         pass
 
     if text_total.strip() == "":
-        pdf.seek(0)
-        images = convert_from_bytes(pdf.read())
-        for img in images:
-            text_total += pytesseract.image_to_string(img, lang="spa") + "\n"
+        try:
+            pdf.seek(0)
+            images = convert_from_bytes(pdf.read())
+            for img in images:
+                text_total += pytesseract.image_to_string(img, lang="spa") + "\n"
+        except:
+            return ""
 
     return text_total
 
@@ -62,10 +66,14 @@ def extreure_blocs(text):
 
 
 def extreure_empresa(bloc):
-    match = re.search(r"Empresa\s+(\d+)\s+([A-Z0-9]+)\s+(.+)", bloc)
+    match = re.search(r"Empresa\s+(\d+)\s+([A-Z0-9]+)?\s*(.+)", bloc)
     if not match:
         return "", ""
-    return match.group(1).strip(), match.group(3).strip()
+
+    codi_empresa = match.group(1).strip()
+    nom_empresa = match.group(3).strip()
+
+    return codi_empresa, nom_empresa
 
 
 def linia_que_comenca(bloc, inici):
@@ -76,20 +84,32 @@ def linia_que_comenca(bloc, inici):
 
 
 def netejar_tokens(tokens):
-    eliminar = {"TOTAL", "EMPRESA", "SUMA", "Y", "SIGUE"}
+    eliminar = {
+        "TOTAL", "EMPRESA", "SUMA", "Y", "SIGUE", "CÓDIGO", "CODIGO",
+        "EMPLEADO", "TREBALLADOR", "TRABAJADOR", "NOM", "NOMBRE"
+    }
     return [t for t in tokens if t.upper() not in eliminar]
 
 
 def extreure_empleats(bloc):
-    linia_codis = linia_que_comenca(bloc, r"^Empleado")
+    linia_codis = linia_que_comenca(bloc, r"^Empleado|^Empleat")
     linia_nom = linia_que_comenca(bloc, r"^Nombre|^Nom")
     linia_cognom1 = linia_que_comenca(bloc, r"^Primer")
-    linia_cognom2 = linia_que_comenca(bloc, r"^Segundo")
+    linia_cognom2 = linia_que_comenca(bloc, r"^Segundo|^Segon")
 
-    codis = netejar_tokens(linia_codis.replace("Empleado", "").split())
-    noms = netejar_tokens(re.sub(r"^Nombre|^Nom", "", linia_nom, flags=re.IGNORECASE).split())
-    cognoms1 = netejar_tokens(re.sub(r"^Primer\s+\S+", "", linia_cognom1, flags=re.IGNORECASE).split())
-    cognoms2 = netejar_tokens(re.sub(r"^Segundo\s+\S+", "", linia_cognom2, flags=re.IGNORECASE).split())
+    codis = re.findall(r"\b\d{4,6}\b", linia_codis)
+
+    noms = netejar_tokens(
+        re.sub(r"^Nombre|^Nom", "", linia_nom, flags=re.IGNORECASE).split()
+    )
+
+    cognoms1 = netejar_tokens(
+        re.sub(r"^Primer\s+\S+", "", linia_cognom1, flags=re.IGNORECASE).split()
+    )
+
+    cognoms2 = netejar_tokens(
+        re.sub(r"^Segundo\s+\S+|^Segon\s+\S+", "", linia_cognom2, flags=re.IGNORECASE).split()
+    )
 
     empleats = []
 
@@ -98,10 +118,12 @@ def extreure_empleats(bloc):
         c1 = cognoms1[i] if i < len(cognoms1) else ""
         c2 = cognoms2[i] if i < len(cognoms2) else ""
 
+        treballador = f"{nom} {c1} {c2}".strip()
+
         empleats.append({
             "posicio": i,
             "codi": codi,
-            "treballador": f"{nom} {c1} {c2}".strip()
+            "treballador": treballador
         })
 
     return empleats
@@ -134,7 +156,12 @@ def extreure_total_correcte(bloc):
 def processar_pdf(text):
     registres = []
 
-    for bloc in extreure_blocs(text):
+    if not text or text.strip() == "":
+        return pd.DataFrame()
+
+    blocs = extreure_blocs(text)
+
+    for bloc in blocs:
         codi_empresa, nom_empresa = extreure_empresa(bloc)
         empleats = extreure_empleats(bloc)
 
@@ -162,6 +189,21 @@ def processar_pdf(text):
     if df.empty:
         return df
 
+    columnes_obligatories = [
+        "Empresa",
+        "Nom empresa",
+        "Codi treballador",
+        "Treballador",
+        "TOTAL DEVENGOS",
+        "TOTAL RETENCION",
+        "TOTAL LIQUIDO",
+        "TOTAL",
+    ]
+
+    for col in columnes_obligatories:
+        if col not in df.columns:
+            df[col] = ""
+
     df = df.groupby(
         ["Empresa", "Nom empresa", "Codi treballador"],
         as_index=False
@@ -176,23 +218,55 @@ def processar_pdf(text):
     return df
 
 
+def validar_dataframe(df, nom_pdf):
+    if df.empty:
+        st.error(f"❌ No s'ha pogut llegir correctament el PDF: {nom_pdf}")
+        st.warning("Comprova que sigui un resum de nòmina amb el mateix format que els altres.")
+        return False
+
+    columnes_necessaries = [
+        "Empresa",
+        "Nom empresa",
+        "Codi treballador",
+        "Treballador",
+        "TOTAL DEVENGOS",
+        "TOTAL RETENCION",
+        "TOTAL LIQUIDO",
+        "TOTAL",
+    ]
+
+    falten = [c for c in columnes_necessaries if c not in df.columns]
+
+    if falten:
+        st.error(f"❌ El PDF {nom_pdf} no té l'estructura esperada.")
+        st.write("Columnes que falten:", falten)
+        return False
+
+    return True
+
+
 def comparar(df_ant, df_act):
     claus = ["Empresa", "Nom empresa", "Codi treballador"]
 
-    df = pd.merge(
-        df_ant,
-        df_act,
-        on=claus,
-        how="outer",
-        suffixes=("_anterior", "_actual"),
-        indicator=True
-    )
+    try:
+        df = pd.merge(
+            df_ant,
+            df_act,
+            on=claus,
+            how="outer",
+            suffixes=("_anterior", "_actual"),
+            indicator=True
+        )
+    except Exception:
+        st.error("❌ Error comparant PDFs. Probablement un dels fitxers no té el format correcte.")
+        st.warning("Prova amb dos resums de nòmina generats amb el mateix format.")
+        st.stop()
 
     files = []
 
     for _, row in df.iterrows():
-        empresa = f'{row["Empresa"]} - {row["Nom empresa"]}'
-        codi = row["Codi treballador"]
+        empresa = f'{row.get("Empresa", "")} - {row.get("Nom empresa", "")}'
+        codi = row.get("Codi treballador", "")
 
         treballador = row.get("Treballador_actual")
         if pd.isna(treballador) or treballador == "":
@@ -209,7 +283,6 @@ def comparar(df_ant, df_act):
 
         valors = [dev_ant, dev_act, ret_ant, ret_act, liq_ant, liq_act, tot_ant, tot_act]
         valors = [0 if pd.isna(v) else v for v in valors]
-
         dev_ant, dev_act, ret_ant, ret_act, liq_ant, liq_act, tot_ant, tot_act = valors
 
         if row["_merge"] == "right_only":
@@ -256,7 +329,6 @@ def exportar_excel(df):
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Informe diferencies")
 
-        workbook = writer.book
         worksheet = writer.sheets["Informe diferencies"]
 
         for column_cells in worksheet.columns:
@@ -269,7 +341,7 @@ def exportar_excel(df):
                 except:
                     pass
 
-            worksheet.column_dimensions[column_letter].width = min(max_length + 3, 45)
+            worksheet.column_dimensions[column_letter].width = min(max_length + 3, 60)
 
     output.seek(0)
     return output
@@ -284,13 +356,21 @@ if pdf_mes_anterior and pdf_mes_actual:
     df_anterior = processar_pdf(text_anterior)
     df_actual = processar_pdf(text_actual)
 
+    valid_anterior = validar_dataframe(df_anterior, "mes anterior")
+    valid_actual = validar_dataframe(df_actual, "mes actual")
+
+    if not valid_anterior or not valid_actual:
+        st.stop()
+
     informe = comparar(df_anterior, df_actual)
 
     if informe.empty:
         st.success("No s'han detectat diferències.")
     else:
+        st.success("Comparació completada correctament.")
         st.subheader("Informe de diferències")
         st.write(f"Treballadors amb incidències: {len(informe)}")
+
         st.dataframe(informe, use_container_width=True)
 
         st.download_button(
